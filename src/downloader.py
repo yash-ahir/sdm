@@ -119,6 +119,7 @@ class Downloader:
         self.resume = False
 
     # Set restart flag and call download() to resume download from previous byte position.
+    # TODO Fix resuming after stopping more than once.
     def reinstate(self):
         self.stop = False
         self.resume = True
