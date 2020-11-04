@@ -13,11 +13,12 @@ class Downloader:
         # Extract the filename from the URL.
         self.fileName = re.search(r"(?:[^/][\d\w.]+)+$", self.url, flags=re.IGNORECASE).group(0)
         self.parts = parts
-        self.fileSize = round(self._getSize())
-        self.partSize = round(self.fileSize / self.parts)
+        fileSize = round(self._getSize())
+        self.partSize = round(fileSize / self.parts)
         self.threads = dict()
         self.partPosition = dict()
         self.partState = dict()
+        self.lastPosition = dict()
         self.stop = False
         self.resume = False
         # Get XML root
@@ -43,7 +44,7 @@ class Downloader:
         self.partPosition[part] = currentDown
 
         if currentDown != 0 and currentDown == totalDown:
-            self.save(part, "complete")
+            self._save(part, "complete")
 
         if self.stop:
             return 1
@@ -64,17 +65,20 @@ class Downloader:
                 # partSize and add partSize to partEnd for changing the end of range.
                 partStart += self.partSize + 1 if part == 1 else self.partSize
                 partEnd += self.partSize
+                self.lastPosition[part] = 0
         else:
-            for file in self.root.findall("file"):
-                if file.get("name") == self.fileName:
-                    for part in file:
-                        if part.get("state") == "incomplete":
-                            partStart = re.search(r"^\d+", part.text).group(0)
-                            partEnd = re.search(r"\d+$", part.text).group(0)
-                            part = int(part.get("id"))
-                            t = threading.Thread(target=self._downloadRange, args=(partStart, partEnd, part))
-                            threads.append(t)
-                            t.start()
+            self.parts = 0
+            for filePart in self._getXMLData():
+                # Increment parts counter by 1 for each incomplete download so that save is called at the
+                # end, use regular expressions to extract starting and ending ranges from states.xml file.
+                self.parts += 1
+                partStart = re.search(r"^\d+", filePart.text).group(0)
+                partEnd = re.search(r"\d+$", filePart.text).group(0)
+                part = int(filePart.get("id"))
+                self.lastPosition[part] = int(partStart)
+                t = threading.Thread(target=self._downloadRange, args=(partStart, partEnd, part))
+                threads.append(t)
+                t.start()
 
         # Call join() on all threads so that _mergeFiles() is only called after thread execution is completed.
         for t in threads:
@@ -103,7 +107,7 @@ class Downloader:
                 curl.perform()
                 curl.close()
         except pycurl.error:
-            self.save(fileNo, "incomplete")
+            self._save(fileNo, "incomplete")
 
     # Merge the file parts into one and delete the parts.
     def _mergeFiles(self, fileName, parts):
@@ -116,17 +120,15 @@ class Downloader:
     # Set stop flag to interrupt perform() execution.
     def interrupt(self):
         self.stop = True
-        self.resume = False
 
     # Set restart flag and call download() to resume download from previous byte position.
     # TODO Fix resuming after stopping more than once.
     def reinstate(self):
-        self.stop = False
         self.resume = True
         self.download()
 
     # Write part position to state.xml file.
-    def save(self, part, state):
+    def _save(self, part, state):
         # Only decrement parts counter if that specific part's state hasn't been added to partState
         # so that it isn't called in succession after download complete because _trackProgress()
         # might be called several times even after completion.
@@ -135,21 +137,47 @@ class Downloader:
             self.partState[part] = state
 
         if not self.parts:
-            data = ET.Element("data")
-            file = ET.SubElement(data, "file")
-            file.set("name", self.fileName)
-
-            for part in self.partPosition.keys():
-                item = ET.SubElement(file, "part")
-                item.set("id", str(part))
-                item.set("state", self.partState[part])
-                # Multiply position with part - 1 to show the total Size for individual part then add the byte position
-                # to partStart, add 1 to partStart for all starting ranges other than the first one.
-                partStart = (self.partSize * (part - 1)) + self.partPosition[part]
-                partStart += 1 if part != 1 else 0
-                partEnd = self.partSize * part
-
-                item.text = str(f"{partStart}-{partEnd}")
+            data = self._setXMLData()
             # TODO Implement writing to state.xml for multiple files, make resumes edit the individual file tags.
             with open("state.xml", "w") as state:
                 state.write(parseString(ET.tostring(data, encoding="unicode")).toprettyxml())
+
+    # Fetches incomplete parts for current download from state.xml file.
+    def _getXMLData(self):
+        for file in self.root.findall("file"):
+            if file.get("name") == self.fileName:
+                for filePart in file:
+                    if filePart.get("state") == "incomplete":
+                        yield filePart
+
+    # Stores the state and byte position of each file part in XML inside a variable.
+    def _setXMLData(self):
+        data = ET.Element("data")
+        file = ET.SubElement(data, "file")
+        file.set("name", self.fileName)
+
+        for part in self.partPosition.keys():
+            item = ET.SubElement(file, "part")
+            item.set("id", str(part))
+            item.set("state", self.partState[part])
+            # Add the last byte position (0 if it's a new download) to the current position of the file part.
+            partStart = self.partPosition[part] + self.lastPosition[part]
+
+            # Add partSize to the starting position only if it's a new download, so that the position isn't
+            # tempered with when resuming, and adding 1 to the starting positions for forming the next range.
+            if not self.resume:
+                partStart += (self.partSize * (part - 1))
+                partStart += 1 if part != 1 else 0
+
+            # Decrement partStart by 1 if the download is complete to cancel out the incrementation done during
+            # the first download, so that the range doesn't go over 100%.
+            if self.partState[part] == "complete":
+                partStart -= 1
+
+            partEnd = self.partSize * part
+            item.text = str(f"{partStart}-{partEnd}")
+
+        if self.stop:
+            self.resume = False
+
+        return data
