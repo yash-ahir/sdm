@@ -6,23 +6,31 @@ import xml.etree.ElementTree as ET
 from xml.dom.minidom import parseString
 
 
-# Get the size of the target file and calculate file part size.
 class Downloader:
-    def __init__(self, url, parts):
+    def __init__(self, url, parts, path, limit):
         self.url = url
         # Extract the filename from the URL.
         self.fileName = re.search(r"(?:[^/][\d\w.]+)+$", self.url, flags=re.IGNORECASE).group(0)
+        self.fileParts = parts
         self.parts = parts
-        fileSize = round(self._getSize())
-        self.partSize = round(fileSize / self.parts)
-        self.threads = dict()
-        self.partPosition = dict()
-        self.partState = dict()
-        self.lastPosition = dict()
+        self.path = path
+        self.limit = limit
+        # Get the size of the target file and calculate file part size.
+        self.fileSize = round(self._getSize())
+        self.partSize = round(self.fileSize / self.parts)
+        self.threads = {}
+        self.partPosition = {}
+        self.partState = {}
+        self.lastPosition = {}
         self.stop = False
         self.resume = False
-        # Get XML root
-        tree = ET.parse("state.xml")
+        self.flag = False
+        self.progress = 0
+        # Get XML root of state.xml file, create file if it doesn't exist.
+        if not os.path.exists(f"{self.path}/{self.fileName}_state.xml"):
+            with open(f"{self.path}/{self.fileName}_state.xml", "w") as state:
+                state.write(ET.tostring(ET.Element("data"), "unicode"))
+        tree = ET.parse(f"{self.path}/{self.fileName}_state.xml")
         self.root = tree.getroot()
 
     # Get file size by only downloading the HEADER and then calling getinfo() for the length.
@@ -38,7 +46,7 @@ class Downloader:
 
     # Track individual file part download progress, return non-zero value if stop flag is set to interrupt perform(),
     # manage state of each part.
-    def _trackProgress(self, totalDown, currentDown, totalUp, currentUp):
+    def _trackProgress(self, totalDown, currentDown, _totalUp, _currentUp):
         part = self.threads[threading.get_native_id()]
         # Add the current byte position of each individual part to a dictionary for writing in state.xml file.
         self.partPosition[part] = currentDown
@@ -48,6 +56,26 @@ class Downloader:
 
         if self.stop:
             return 1
+
+    # Return the total download progress in bytes
+    def getProgress(self):
+        progress = 0
+
+        if self.resume:
+            if not self.flag:
+                self.flag = True
+                for i in range(1, self.fileParts + 1):
+                    self.progress += int(os.stat(f"{self.path}/{self.fileName}{i}.part").st_size)
+            progress += self.progress
+
+        for position in self.partPosition.values():
+            progress += position
+
+        if progress > self.fileSize:
+            difference = progress - self.fileSize
+            progress -= difference
+
+        return progress
 
     # Calculate the part size, execute _downloadRange() in separate threads, merge file parts on download completion.
     def download(self):
@@ -76,6 +104,7 @@ class Downloader:
                 partEnd = re.search(r"\d+$", filePart.text).group(0)
                 part = int(filePart.get("id"))
                 self.lastPosition[part] = int(partStart)
+
                 t = threading.Thread(target=self._downloadRange, args=(partStart, partEnd, part))
                 threads.append(t)
                 t.start()
@@ -87,22 +116,23 @@ class Downloader:
         # Only call _mergeFiles() if stop flag is set to false, so that it isn't called when pausing/stopping
         # the download.
         if not self.stop:
-            self._mergeFiles(self.fileName, parts)
+            self._mergeFiles(f"{self.path}/{self.fileName}", parts)
 
     # Download the specified range and write it to a file part, stop download if any exception is caught.
     def _downloadRange(self, startRange, endRange, fileNo):
         # Get uniquely assigned ID of the current thread by the kernel to identify file part.
         self.threads[threading.get_native_id()] = fileNo
-        path = f"{self.fileName}{fileNo}.part"
+        path = f"{self.path}/{self.fileName}{fileNo}.part"
         try:
             # Append bytes to file if it exists (resuming) else only write.
-            with open(path, "ab" if os.path.exists(path) else "wb") as f:
+            with open(path, "ab" if (os.path.exists(path)) else "wb") as f:
                 curl = pycurl.Curl()
                 curl.setopt(curl.URL, self.url)
                 curl.setopt(curl.FOLLOWLOCATION, True)
                 curl.setopt(curl.RANGE, f"{startRange}-{endRange}")
                 curl.setopt(curl.WRITEDATA, f)
                 curl.setopt(curl.NOPROGRESS, False)
+                curl.setopt(curl.MAX_RECV_SPEED_LARGE, self.limit)
                 curl.setopt(curl.XFERINFOFUNCTION, self._trackProgress)
                 curl.perform()
                 curl.close()
@@ -113,9 +143,10 @@ class Downloader:
     def _mergeFiles(self, fileName, parts):
         with open(fileName, "wb") as o:
             for part in range(1, parts + 1):
-                with open(f"{self.fileName}{part}.part", "rb") as p:
+                with open(f"{self.path}/{self.fileName}{part}.part", "rb") as p:
                     o.write(p.read())
-                os.remove(f"{self.fileName}{part}.part")
+                os.remove(f"{self.path}/{self.fileName}{part}.part")
+            #os.remove(f"{self.path}/{self.fileName}_state.xml")
 
     # Set stop flag to interrupt perform() execution.
     def interrupt(self):
@@ -137,17 +168,15 @@ class Downloader:
 
         if not self.parts:
             data = self._setXMLData()
-            # TODO Implement writing to state.xml for multiple files, make resumes edit the individual file tags.
-            with open("state.xml", "w") as state:
+            with open(f"{self.path}/{self.fileName}_state.xml", "w") as state:
                 state.write(parseString(ET.tostring(data, encoding="unicode")).toprettyxml())
 
-    # Fetches incomplete parts for current download from state.xml file.
+    # Fetches incomplete states for the current download from state.xml file.
     def _getXMLData(self):
-        for file in self.root.findall("file"):
-            if file.get("name") == self.fileName:
-                for filePart in file:
-                    if filePart.get("state") == "incomplete":
-                        yield filePart
+        file = self.root.find("file")
+        for filePart in file:
+            if filePart.get("state") == "incomplete":
+                yield filePart
 
     # Stores the state and byte position of each file part in XML inside a variable.
     def _setXMLData(self):
@@ -175,8 +204,5 @@ class Downloader:
 
             partEnd = self.partSize * part
             item.text = str(f"{partStart}-{partEnd}")
-
-        if self.stop:
-            self.resume = False
 
         return data

@@ -146,9 +146,9 @@
         </widget>
        </item>
        <item row="8" column="1">
-        <widget class="QPushButton" name="deleteButton">
+        <widget class="QPushButton" name="resumeButton">
          <property name="text">
-          <string>Delete</string>
+          <string>Resume</string>
          </property>
         </widget>
        </item>
@@ -268,7 +268,7 @@
   <tabstop>limitDownloadSpeed</tabstop>
   <tabstop>speedLimit</tabstop>
   <tabstop>pauseButton</tabstop>
-  <tabstop>deleteButton</tabstop>
+  <tabstop>resumeButton</tabstop>
  </tabstops>
  <resources/>
  <connections/>
